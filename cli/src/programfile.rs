@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+use crate::input::ProgramInput;
 use anyhow::{Context, bail};
 use indexmap::IndexMap;
-use std::{
-    fs,
-    io::{Seek, SeekFrom},
-    path::Path,
-    str::FromStr,
-};
+use std::{fs, path::Path, str::FromStr};
 use xmltree::{self, Element, XMLNode};
 
 use qdl::{
@@ -105,6 +101,7 @@ fn parse_patch_cmd<T: QdlChan>(
         start_sector,
         val,
     )
+    .map_err(Into::into)
 }
 
 const BOOTABLE_PART_NAMES: [&str; 3] = ["xbl", "xbl_a", "sbl1"];
@@ -132,11 +129,10 @@ fn parse_program_cmd<T: QdlChan>(
     };
     let phys_part_idx = parse_attr::<u8>(attrs, "physical_partition_number")?;
     let start_sector = get_attr(attrs, "start_sector")?;
-    // file_sector_offset is optional; treat a missing or unparseable value as 0
-    let file_sector_offset = attrs
-        .get("file_sector_offset")
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(0);
+    let file_sector_offset = match attrs.get("file_sector_offset") {
+        Some(_) => parse_attr::<u64>(attrs, "file_sector_offset")?,
+        None => 0,
+    };
 
     let label = get_attr(attrs, "label")?;
     if num_sectors == 0 {
@@ -163,11 +159,12 @@ fn parse_program_cmd<T: QdlChan>(
         }
     }
 
-    let mut buf = fs::File::open(&file_path)
+    let file = fs::File::open(&file_path)
         .with_context(|| format!("Couldn't open program file {}", file_path.display()))?;
-    buf.seek(SeekFrom::Current(
-        sector_size as i64 * file_sector_offset as i64,
-    ))?;
+    let offset = file_sector_offset
+        .checked_mul(sector_size as u64)
+        .context("Program source offset overflow")?;
+    let mut buf = ProgramInput::from_file(file, sector_size, offset, Some(num_sectors))?;
 
     firehose_program_storage(
         channel,
@@ -178,6 +175,7 @@ fn parse_program_cmd<T: QdlChan>(
         phys_part_idx,
         start_sector,
     )
+    .map_err(Into::into)
 }
 
 // TODO: there's some funny optimizations to make here, such as OoO loading files into memory, or doing things while we're waiting on the device to finish

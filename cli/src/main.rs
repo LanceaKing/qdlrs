@@ -3,12 +3,16 @@
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use clap_num::maybe_hex;
+use input::{ProgramInput, zero_input};
 use itertools::Itertools;
 use owo_colors::OwoColorize;
-use qdl::parsers::{firehose_parser_ack_nak, firehose_parser_configure_response};
+use qdl::parsers::firehose_parser_configure_response;
 use qdl::sahara::{SaharaCmdModeCmd, SaharaMode, sahara_run, sahara_send_hello_rsp};
 use qdl::types::{FirehoseResetMode, FirehoseStorageType, QdlBackend, QdlDevice};
-use qdl::{firehose_configure, firehose_read, firehose_reset, types::FirehoseConfiguration};
+use qdl::{
+    firehose_configure, firehose_read, firehose_read_welcome, firehose_reset,
+    types::FirehoseConfiguration,
+};
 use qdl::{
     firehose_get_default_sector_size, firehose_nop, firehose_peek, firehose_program_storage,
     firehose_set_bootable, load_programmer_images, setup_target_device,
@@ -21,6 +25,7 @@ use std::fs::{self, File};
 use std::{path::Path, str::FromStr};
 
 mod flasher;
+mod input;
 mod programfile;
 mod util;
 
@@ -286,17 +291,18 @@ fn main() -> Result<()> {
         args.verbose_sahara,
     )?;
 
-    // If we're past Sahara, activate the Firehose reset-on-drop listener
-    qdl_dev.reset_on_drop = true;
-
     // Get any "welcome" logs
-    firehose_read(&mut qdl_dev, firehose_parser_ack_nak)?;
+    firehose_read_welcome(&mut qdl_dev)?;
 
     // Send the host capabilities to the device
     firehose_configure(&mut qdl_dev, args.skip_storage_init)?;
 
     // Parse some information from the device
-    firehose_read(&mut qdl_dev, firehose_parser_configure_response)?;
+    if firehose_read(&mut qdl_dev, firehose_parser_configure_response)?
+        != qdl::types::FirehoseStatus::Ack
+    {
+        bail!("Firehose configuration was NAKed");
+    }
 
     match args.command {
         Command::Dump { outdir } => {
@@ -337,12 +343,14 @@ fn main() -> Result<()> {
         }
         Command::Erase { name } => {
             let part = find_part(&mut qdl_dev, &name, args.storage_slot, args.phys_part_idx)?;
+            let num_sectors = usize::try_from(part.size()?)?;
+            let mut data = zero_input(num_sectors, qdl_dev.fh_cfg.storage_sector_size)?;
 
             firehose_program_storage(
                 &mut qdl_dev,
-                &mut &[0u8][..],
+                &mut data,
                 &name,
-                (part.ending_lba - part.starting_lba + 1) as usize,
+                num_sectors,
                 args.storage_slot,
                 args.phys_part_idx,
                 &part.starting_lba.to_string(),
@@ -368,17 +376,19 @@ fn main() -> Result<()> {
                 .unwrap()
         ),
         Command::OverwriteStorage { file_path } => {
-            let mut file = File::open(file_path)?;
-            let file_len_sectors = file
-                .metadata()?
-                .len()
-                .div_ceil(qdl_dev.fh_cfg.storage_sector_size as u64);
+            let mut file = ProgramInput::from_file(
+                File::open(file_path)?,
+                qdl_dev.fh_cfg.storage_sector_size,
+                0,
+                None,
+            )?;
+            let file_len_sectors = file.num_sectors();
 
             firehose_program_storage(
                 &mut qdl_dev,
                 &mut file,
                 "",
-                file_len_sectors as usize,
+                file_len_sectors,
                 args.storage_slot,
                 args.phys_part_idx,
                 "0",
@@ -402,14 +412,16 @@ fn main() -> Result<()> {
                 args.storage_slot,
                 args.phys_part_idx,
             )?;
-            let mut file = File::open(file_path)?;
-            let file_len_sectors = file
-                .metadata()?
-                .len()
-                .div_ceil(qdl_dev.fh_cfg.storage_sector_size as u64);
-            let part_len_sectors = part.ending_lba - part.starting_lba + 1;
+            let mut file = ProgramInput::from_file(
+                File::open(file_path)?,
+                qdl_dev.fh_cfg.storage_sector_size,
+                0,
+                None,
+            )?;
+            let file_len_sectors = file.num_sectors();
+            let part_len_sectors = part.size()?;
 
-            if file_len_sectors > part_len_sectors {
+            if file_len_sectors as u64 > part_len_sectors {
                 bail!(
                     "Partition {} is too small for the specified image ({} > {})",
                     part_name,
@@ -422,7 +434,7 @@ fn main() -> Result<()> {
                 &mut qdl_dev,
                 &mut file,
                 &part_name,
-                file_len_sectors as usize,
+                file_len_sectors,
                 args.storage_slot,
                 args.phys_part_idx,
                 &part.starting_lba.to_string(),

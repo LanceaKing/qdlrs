@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
-use anyhow::{Result, bail};
+use anyhow::Result;
 use serial2::{self, SerialPort};
 use std::io::{BufRead, Read, Write};
 
-use crate::types::QdlReadWrite;
+use crate::{select_and_open, types::QdlReadWrite};
+use std::time::Duration;
 
 pub struct QdlSerialConfig {
     serport: SerialPort,
@@ -13,7 +14,6 @@ pub struct QdlSerialConfig {
     cap: usize,
 }
 
-// TODO: timeouts?
 impl Write for QdlSerialConfig {
     fn write(&mut self, buf: &[u8]) -> Result<usize, std::io::Error> {
         self.serport.write(buf)
@@ -25,6 +25,9 @@ impl Write for QdlSerialConfig {
 
 impl Read for QdlSerialConfig {
     fn read(&mut self, out: &mut [u8]) -> Result<usize, std::io::Error> {
+        if out.is_empty() {
+            return Ok(0);
+        }
         // Drain internal buffer first
         if self.pos < self.cap {
             let n = std::cmp::min(out.len(), self.cap - self.pos);
@@ -60,21 +63,29 @@ impl BufRead for QdlSerialConfig {
 
 impl QdlReadWrite for QdlSerialConfig {}
 
+/// Enumerate paths without opening a port.
+pub fn list_serial_device_keys() -> Result<Vec<String>> {
+    Ok(SerialPort::available_ports()?
+        .into_iter()
+        .filter_map(|path| path.into_os_string().into_string().ok())
+        .collect())
+}
+
 pub fn setup_serial_device(dev_path: Option<String>) -> Result<QdlSerialConfig> {
-    if dev_path.is_none() {
-        bail!("Serial port path unspecified");
-    }
-
-    let serport = SerialPort::open(dev_path.unwrap(), |mut settings: serial2::Settings| {
-        settings.set_raw();
-        settings.set_baud_rate(115200)?;
-        Ok(settings)
-    })?;
-
-    Ok(QdlSerialConfig {
-        serport,
-        buf: Vec::new(),
-        pos: 0,
-        cap: 0,
+    let keys = list_serial_device_keys()?;
+    select_and_open(&keys, dev_path.as_deref(), |index| {
+        let mut serport = SerialPort::open(&keys[index], |mut settings: serial2::Settings| {
+            settings.set_raw();
+            settings.set_baud_rate(115200)?;
+            Ok(settings)
+        })?;
+        serport.set_read_timeout(Duration::from_secs(10))?;
+        serport.set_write_timeout(Duration::from_secs(10))?;
+        Ok(QdlSerialConfig {
+            serport,
+            buf: Vec::new(),
+            pos: 0,
+            cap: 0,
+        })
     })
 }

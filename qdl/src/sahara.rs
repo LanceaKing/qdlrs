@@ -8,7 +8,7 @@ use std::{
     ffi::CStr,
     fs::File,
     io::{Read, Write},
-    mem::{self, size_of_val},
+    mem::size_of_val,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -224,22 +224,28 @@ pub fn sahara_send_img_to_device<T: Read + Write>(
     image_offset: u64,
     image_len: u64,
 ) -> Result<usize, anyhow::Error> {
-    let image = if img_arr.len() == 1 { 0 } else { image_idx };
-    let Some(Some(buf)) = img_arr.get(image as usize) else {
-        bail!("Sahara requested missing image ID {}", image_idx,);
+    let image = if img_arr.len() == 1 {
+        0
+    } else {
+        usize::try_from(image_idx).context("Image ID exceeds host address space")?
     };
-    if (image_offset + image_len) as usize > buf.len() {
-        bail!(
-            "Attempted OOB read {} > {}",
-            image_offset + image_len,
-            buf.len()
-        );
+    let Some(Some(buf)) = img_arr.get(image) else {
+        bail!("Sahara requested missing image ID {image_idx}");
+    };
+    let end = image_offset
+        .checked_add(image_len)
+        .context("Sahara image range overflow")?;
+    let start = usize::try_from(image_offset).context("Image offset exceeds host address space")?;
+    let end = usize::try_from(end).context("Image end exceeds host address space")?;
+    let requested = buf
+        .get(start..end)
+        .context("Sahara requested data outside the image")?;
+    if requested.is_empty() {
+        bail!("Sahara requested an empty image range");
     }
-
-    channel
-        .write_all(&buf[image_offset as usize..(image_offset + image_len) as usize])
-        .map(|_| image_len as usize)
-        .map_err(|e| e.into())
+    channel.write_all(requested)?;
+    channel.flush()?;
+    Ok(requested.len())
 }
 
 fn sahara_send_generic<T: Read + Write>(
@@ -254,12 +260,11 @@ fn sahara_send_generic<T: Read + Write>(
         body,
     };
 
-    let serialized = serialize(&pkt).expect("Error serializing packet");
+    let serialized = serialize(&pkt).context("Error serializing Sahara packet")?;
     let len = serialized.len();
-    channel
-        .write_all(&serialized)
-        .map(|_| len)
-        .map_err(|e| e.into())
+    channel.write_all(&serialized)?;
+    channel.flush()?;
+    Ok(len)
 }
 
 const SAHARA_VERSION: u32 = 2;
@@ -511,15 +516,13 @@ pub fn sahara_run<T: QdlChan>(
     filenames: Vec<String>,
     verbose: bool,
 ) -> Result<Vec<u8>> {
+    let verbose = verbose && !channel.fh_config().quiet;
     loop {
         let pkt = sahara_read_packet(channel, verbose)?;
-        let pktsize = size_of_val(&pkt.cmd) + size_of_val(&pkt.len);
 
         match pkt.cmd {
             SaharaCmd::SaharaHello => {
                 if let SaharaPacketBody::HelloReq(req) = pkt.body {
-                    assert_eq!(pkt.len as usize, pktsize + mem::size_of::<HelloReq>());
-
                     // MemoryDebug mode can only be entered if the device offers it
                     let mode = if sahara_mode == SaharaMode::MemoryDebug
                         && req.mode == SaharaMode::MemoryDebug
@@ -533,7 +536,6 @@ pub fn sahara_run<T: QdlChan>(
             }
             SaharaCmd::SaharaReadData => {
                 if let SaharaPacketBody::ReadReq(rr) = pkt.body {
-                    assert_eq!(pkt.len as usize, pktsize + mem::size_of::<ReadReq>());
                     sahara_send_img_to_device(
                         channel,
                         images,
@@ -545,8 +547,6 @@ pub fn sahara_run<T: QdlChan>(
             }
             SaharaCmd::SaharaEndOfImage => {
                 if let SaharaPacketBody::Eoi(req) = pkt.body {
-                    assert_eq!(pkt.len as usize, pktsize + mem::size_of::<Eoi>());
-
                     if req.status == 0 {
                         sahara_send_done(channel)?;
                     } else {
@@ -555,16 +555,20 @@ pub fn sahara_run<T: QdlChan>(
                 }
             }
             SaharaCmd::SaharaDoneResp => {
-                if let SaharaPacketBody::DoneResp(req) = pkt.body
-                    && (req.status == 1 /* COMPLETE */ /* 8916 bug */ ||
-                     images.len() == 1)
-                {
-                    println!("{}", "Loader sent. Hack away!".green());
+                if let SaharaPacketBody::DoneResp(req) = pkt.body {
+                    if req.status > 1 {
+                        bail!("Invalid Sahara completion status {}", req.status);
+                    }
+                    if req.status == 0 && images.len() != 1 {
+                        continue;
+                    }
+                    if !channel.fh_config().quiet {
+                        println!("{}", "Loader sent. Hack away!".green());
+                    }
                     return Ok(vec![]);
                 }
             }
             SaharaCmd::SaharaCommandReady => {
-                assert_eq!(pkt.len as usize, pktsize);
                 match sahara_command {
                     Some(cmd) => sahara_send_cmd_exec(channel, cmd),
                     None => bail!("Missing sahara command"),
@@ -587,8 +591,6 @@ pub fn sahara_run<T: QdlChan>(
             }
             SaharaCmd::SaharaMemDebug64 => {
                 if let SaharaPacketBody::Debug64Req(req) = pkt.body {
-                    assert_eq!(pkt.len as usize, pktsize + mem::size_of::<Debug64Req>());
-
                     // Receive the dump info table
                     let dump_tbl = sahara_get_ramdump_tbl(channel, req.addr, req.len, verbose)?;
 
@@ -600,17 +602,17 @@ pub fn sahara_run<T: QdlChan>(
             }
             SaharaCmd::SaharaReadData64 => {
                 if let SaharaPacketBody::ReadData64Req(rr) = pkt.body {
-                    assert_eq!(pkt.len as usize, pktsize + mem::size_of::<ReadData64Req>());
                     sahara_send_img_to_device(channel, images, rr.image, rr.offset, rr.len)?;
                 }
             }
             SaharaCmd::SaharaResetResp => {
-                assert_eq!(pkt.len as usize, pktsize);
                 return Ok(vec![]);
             }
             SaharaCmd::SaharaXML => {
                 // Todo: make this optionally "fine"
-                println!("Device booted into the loader already");
+                if !channel.fh_config().quiet {
+                    println!("Device booted into the loader already");
+                }
                 return Ok(vec![]);
             }
             _ => bail!("Got unexpected packet {:?}", pkt),
@@ -628,6 +630,20 @@ fn sahara_parse_packet(buf: &[u8], verbose: bool) -> Result<SaharaPacket> {
 
     let cmd = bincode::deserialize::<SaharaCmd>(cmd)
         .map_err(|_| anyhow!("Got unknown command {}", u32::from_le_bytes(*cmd)))?;
+
+    let body_len = match cmd {
+        SaharaCmd::SaharaHello | SaharaCmd::SaharaHelloResp => 40,
+        SaharaCmd::SaharaReadData => 12,
+        SaharaCmd::SaharaEndOfImage | SaharaCmd::SaharaExecuteResp => 8,
+        SaharaCmd::SaharaDone | SaharaCmd::SaharaResetResp | SaharaCmd::SaharaCommandReady => 0,
+        SaharaCmd::SaharaDoneResp | SaharaCmd::SaharaExecuteData => 4,
+        SaharaCmd::SaharaMemDebug64 | SaharaCmd::SaharaMemRead64 => 16,
+        SaharaCmd::SaharaReadData64 => 24,
+        _ => bail!("Unsupported Sahara command {cmd:?}"),
+    };
+    if u32::from_le_bytes(*len) as usize != 8 + body_len || args.len() != body_len {
+        bail!("Invalid {cmd:?} packet length");
+    }
 
     let ret = SaharaPacket {
         cmd,

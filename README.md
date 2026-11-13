@@ -4,6 +4,59 @@ Qualcomm SoCs feature the Emergency Download Mode (EDL, widely known as '9008 mo
 
 `qdl` provides a Rust implementation for the Sahara and Firehose protocols that are used to communicate with a device in that mode.
 
+## Oplus EDL fork
+
+This fork starts at Qualcomm commit `75fe2f7e42546a1d75969040378d4616419a9dcf`.
+It contains the first protocol fixes for Oplus EDL. The workspace still contains the upstream tools and retains the BSD-3-Clause license.
+The tests use scripted transport. They do not open USB devices or serial ports.
+Offline success does not establish device support.
+
+`firehose_program_storage`, `firehose_patch`, `firehose_set_bootable`, and `firehose_reset` return `MutationFailure` on failure.
+Its `confirmation` field is `NotSent`, `Rejected`, or `Unknown`. Its `cause` field retains the original error.
+A complete NAK means `Rejected`. A transport failure after sending starts means `Unknown`.
+Success requires the final ACK. Callers must stop after failure and must not automatically retry modifications.
+Neither errors nor `QdlDevice` destruction send reset commands. The retained `reset_on_drop` field has no effect.
+Call `firehose_reset` explicitly when the workflow permits a reset.
+
+The program input must supply all requested sector bytes. The library no longer pads early EOF with buffer contents.
+Callers that permit a partial final sector must provide that padding explicitly.
+The upstream CLI uses a bounded zero stream for erase and pads only the final image sector.
+Rawprogram file offsets and lengths are checked before that program command is sent.
+A file that shrinks after this check still fails; it is not padded to hide missing source bytes.
+Serial writes can continue after a short write. USB writes require a complete transfer and reject short completions.
+USB cancellation becomes `TimedOut`, because cancellation can occur after bytes reach the device.
+Storage reads require complete output writes, a successful output flush, and a final ACK.
+Only a complete NAK before raw data, without retry/restart hints or a raw-mode indication, produces `ReadRejected`.
+An absent `rawmode` attribute or `rawmode="false"` permits this classification. Other read failures require stopping the session.
+
+`firehose_read_welcome` collects startup logs. An idle timeout ends welcome collection only at an XML document boundary.
+XML whitespace between welcome documents or after a complete welcome document is allowed. Partial XML still fails on timeout.
+`firehose_read` requires a complete response, even after a log or partial XML.
+`firehose_get_storage_info` returns log messages and response attributes, and reports NAK as an error.
+Configuration responses update sizes only after a valid ACK. They do not send another configure or reset command.
+Payload sizes must be nonzero sector multiples. Payload and XML buffers have a 16 MiB limit.
+`bypass_storage` defaults to false. The existing explicit throughput-testing setting remains available.
+
+Use `list_usb_device_keys` with `setup_usb_device_by_key` to select a physical USB location.
+`setup_usb_device_at` uses the same selection check. The legacy USB entry point requires an exact serial-number match.
+Serial selection requires an enumerated port path. Missing, absent, or duplicate selections never open a device.
+Set `FirehoseConfiguration::quiet` to suppress logs and progress on the loader and storage paths.
+The upstream CLI keeps its own output and successful-run reset policy. It is not the Oplus EDL product CLI.
+
+Run the offline checks from the fork directory:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features --locked
+cargo build --workspace --all-features --locked
+```
+
+The integration suites are `firehose_io`, `sahara_transfer`, `selection`, and the CLI's `program_input`.
+The CLI suite exercises the production input adapters and rawprogram parser with temporary files and scripted transport.
+They cover local file faults separately from transport faults. Command records remain available after the session is dropped.
+Product workflows and their stop and verification policies belong to later implementation stages.
+
 ## Contents
 ```
 cli/ - A CLI tool used to communicate with devices in EDL mode
@@ -123,7 +176,7 @@ Due to how the protocol is constructed, particularly when interfacing with UFS, 
   
 ### Example with UFS as primary storage, reboots to OS after flashing ends
 ```
-qdl-rs -l prog_firehose_ddr.elf -s ufs --reset-mode system flasher -p rawprogram*.xml -x patch*.xml
+qdl-rs --serial-no <SERIAL_NO> -l prog_firehose_ddr.elf -s ufs --reset-mode system flasher -p rawprogram*.xml -x patch*.xml
 
 # NOTE: qdl-rs will flash anything you pass as a parameter. Some METAs ship a number of rawprogram0_foo.xml
 # files which may be undesirable (e.g. _WIPE_GPT). You can filter those out with e.g.:
@@ -136,7 +189,7 @@ find /path/to/build/ -regex '.*/rawprogram[0-9]+\.xml$'
 <summary>Reboot the device back to the OS</summary>
 
 ```
-qdl-rs -l prog_firehose_ddr.elf -s ufs reset system
+qdl-rs --serial-no <SERIAL_NO> -l prog_firehose_ddr.elf -s ufs reset system
 ```
 
 </details>
@@ -145,7 +198,7 @@ qdl-rs -l prog_firehose_ddr.elf -s ufs reset system
 <summary>Dump the entire physical storage partition (e.g. LUN)</summary>
   
 ```
-qdl-rs -l prog_firehose_ddr.elf -s ufs --phys-part-idx 2 dump -o lun2/
+qdl-rs --serial-no <SERIAL_NO> -l prog_firehose_ddr.elf -s ufs --phys-part-idx 2 dump -o lun2/
 ```
 
 </details>
@@ -154,7 +207,7 @@ qdl-rs -l prog_firehose_ddr.elf -s ufs --phys-part-idx 2 dump -o lun2/
 <summary>Fetch a single partition from LUN2</summary>
 
 ```
-qdl-rs -l prog_firehose_ddr.elf -s ufs --phys-part-idx 2 dump-part EFI
+qdl-rs --serial-no <SERIAL_NO> -l prog_firehose_ddr.elf -s ufs --phys-part-idx 2 dump-part EFI
 ```
 
 </details>
@@ -163,7 +216,7 @@ qdl-rs -l prog_firehose_ddr.elf -s ufs --phys-part-idx 2 dump-part EFI
 <summary>Overwrite a single partition on LUN0</summary>
 
 ```
-qdl-rs -l prog_firehose_ddr.elf -s ufs --phys-part-idx 0 write boot boot.img
+qdl-rs --serial-no <SERIAL_NO> -l prog_firehose_ddr.elf -s ufs --phys-part-idx 0 write boot boot.img
 ```
 
 </details>
@@ -172,7 +225,7 @@ qdl-rs -l prog_firehose_ddr.elf -s ufs --phys-part-idx 0 write boot boot.img
 <summary>Print out the partition table on LUN4</summary>
 
 ```
-qdl-rs -l prog_firehose_ddr.elf -s ufs --phys-part-idx 4 print-gpt
+qdl-rs --serial-no <SERIAL_NO> -l prog_firehose_ddr.elf -s ufs --phys-part-idx 4 print-gpt
 ```
 
 </details>
@@ -181,7 +234,7 @@ qdl-rs -l prog_firehose_ddr.elf -s ufs --phys-part-idx 4 print-gpt
 <summary>Overwrite the entirety of LUN7 (VERY dangerous, may remove device-unique data)</summary>
 
 ```
-qdl-rs -l prog_firehose_ddr.elf -s ufs --phys-part-idx 7 overwrite-storage lun7_dump.img
+qdl-rs --serial-no <SERIAL_NO> -l prog_firehose_ddr.elf -s ufs --phys-part-idx 7 overwrite-storage lun7_dump.img
 ```
 
 </details>
@@ -190,7 +243,7 @@ qdl-rs -l prog_firehose_ddr.elf -s ufs --phys-part-idx 7 overwrite-storage lun7_
 <summary>Erase a partition on eMMC (VERY dangerous, may remove device-unique data)</summary>
 
 ```
-qdl-rs -l prog_firehose_ddr.elf -s emmc erase boot
+qdl-rs --serial-no <SERIAL_NO> -l prog_firehose_ddr.elf -s emmc erase boot
 ```
 
 </details>
@@ -199,7 +252,7 @@ qdl-rs -l prog_firehose_ddr.elf -s emmc erase boot
 <summary>Set LUN2 as bootable (i.e. containing xbl)</summary>
 
 ```
-qdl-rs -l prog_firehose_ddr.elf -s ufs set-bootable-part 2
+qdl-rs --serial-no <SERIAL_NO> -l prog_firehose_ddr.elf -s ufs set-bootable-part 2
 ```
 
 </details>

@@ -37,7 +37,7 @@ This is a Cargo workspace with three members:
 ### `qdl/` — core library
 The protocol implementation. Exposes everything the CLI and ramdump tools need.
 
-- **`src/types.rs`** — shared traits and structs. `QdlReadWrite` is the raw transport trait. `QdlDevice<T>` wraps it with a `FirehoseConfiguration` and implements `QdlChan`. `QdlChan: BufRead + Write` is what all Firehose functions accept. `QdlDevice` resets the board to EDL on `Drop` if an operation failed mid-flight.
+- **`src/types.rs`** — shared traits and structs. `QdlReadWrite` is the raw transport trait. `QdlDevice<T>` wraps it with a `FirehoseConfiguration` and implements `QdlChan`. `QdlChan: BufRead + Write` is what all Firehose functions accept. `QdlDevice` never sends commands on `Drop`. The retained `reset_on_drop` field is ignored. Modifying paths return `MutationFailure`, with a confirmation state and the original error.
 - **`src/lib.rs`** — all Firehose XML protocol functions (`firehose_configure`, `firehose_program_storage`, `firehose_read_storage`, `firehose_reset`, etc.). Also contains `load_programmer_images`, which handles both plain ELF loaders and CPIO `newc` multi-image archives (used on newer platforms like SM8750 with `xbl_s_devprg_ns.melf`).
 - **`src/sahara.rs`** — Sahara binary protocol (the first stage before Firehose). `sahara_run` drives the full state machine; `sahara_dump_regions` handles crash ramdumps.
 - **`src/parsers.rs`** — XML response parsers for Firehose ACK/NAK and configure responses.
@@ -47,6 +47,7 @@ The protocol implementation. Exposes everything the CLI and ramdump tools need.
 The main user-facing tool. Parses args with `clap`, constructs a `QdlDevice`, runs Sahara to load the programmer, then dispatches Firehose commands.
 
 - **`src/main.rs`** — CLI entry point and subcommand dispatch.
+- **`src/input.rs`** — bounded erase input and file ranges with explicit final-sector padding. File truncation remains an error.
 - **`src/flasher.rs`** — `flasher` subcommand: reads `rawprogramN.xml` and `patchN.xml`, drives `firehose_program_storage` and `firehose_patch` in sequence.
 - **`src/programfile.rs`** — parses rawprogram/patch XML files into operation structs.
 - **`src/util.rs`** — GPT helpers (`read_gpt_from_storage`, `find_part`, `print_partition_table`).
@@ -59,6 +60,12 @@ Connects to a crashed device, runs Sahara in memory-debug mode, and dumps select
 - **Two-phase boot**: every operation starts with a Sahara handshake to upload a programmer ELF (or CPIO archive) into device RAM, then switches to Firehose XML over the same transport.
 - **LUN/physical partition index**: UFS devices require explicit `--phys-part-idx` for all storage operations. The `flasher` command reads this from the XML files automatically; all other commands need it set explicitly.
 - **Sector size matters**: wrong `--sector-size` causes NAK on `<program>` operations. Defaults vary by storage type (eMMC/NVMe: 512, UFS/NAND/SPINOR: 4096).
+- **Offline tests**: `qdl/tests/support/mod.rs` supplies `ScriptedIo`. `firehose_io`, `sahara_transfer`, `selection`, and the CLI's `program_input` do not enumerate or open hardware. The USB unit tests check completion lengths and cancellation error mapping without a device.
+- **Explicit selection**: USB and serial opening use `select_and_open`. No selection, no match, or duplicate matches must return before calling the open closure. Use the USB location-key API for product integration.
+- **Failure handling**: Stop after a failed modification. `NotSent` means local validation failed before sending. `Rejected` means a complete NAK. `Unknown` means the request could have reached the device without final confirmation. Do not send reset or retry from an error handler.
+- **Read rejection**: `ReadRejected` requires an initial complete NAK with no retry/restart hint and `rawmode` absent or `false`. Other read failures require stopping the session.
+- **Input and configuration**: Program callers supply every requested sector byte, including any permitted tail padding. The default configuration uses `SkipWrite=0`. Invalid or zero payload sizes return errors. Configuration parsing does not send follow-up commands.
+- **Output**: Product callers set `FirehoseConfiguration::quiet`. This suppresses logs and progress on loader/storage paths. Startup logs use `firehose_read_welcome`, while command responses use `firehose_read`. Storage information is returned as data.
 - **XML framing on serial**: Firehose XML packets aren't naturally delimited over serial; `firehose_read` scans for `</data>` to find message boundaries rather than relying on packet framing.
 
 ## Keeping this file current

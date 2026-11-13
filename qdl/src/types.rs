@@ -7,9 +7,68 @@ use std::{
 };
 
 use anyhow::{Error, bail};
-use owo_colors::OwoColorize;
+/// Confirmation available when a modifying request fails.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MutationConfirmation {
+    NotSent,
+    Rejected,
+    Unknown,
+}
 
-use crate::firehose_reset;
+/// A failed modification, retaining the original error and wire confirmation.
+#[derive(Debug)]
+pub struct MutationFailure {
+    pub confirmation: MutationConfirmation,
+    pub cause: anyhow::Error,
+}
+
+impl MutationFailure {
+    pub fn not_sent(cause: impl Into<anyhow::Error>) -> Self {
+        Self {
+            confirmation: MutationConfirmation::NotSent,
+            cause: cause.into(),
+        }
+    }
+
+    pub fn rejected(cause: impl Into<anyhow::Error>) -> Self {
+        Self {
+            confirmation: MutationConfirmation::Rejected,
+            cause: cause.into(),
+        }
+    }
+
+    pub fn unknown(cause: impl Into<anyhow::Error>) -> Self {
+        Self {
+            confirmation: MutationConfirmation::Unknown,
+            cause: cause.into(),
+        }
+    }
+}
+
+impl Display for MutationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}: {}", self.confirmation, self.cause)
+    }
+}
+
+impl std::error::Error for MutationFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.cause.as_ref())
+    }
+}
+
+/// A complete initial read NAK with no retry/restart hint or raw-mode indication.
+/// Other read failures require stopping the session.
+#[derive(Debug)]
+pub struct ReadRejected;
+
+impl Display for ReadRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Read request was NAKed before raw data")
+    }
+}
+
+impl std::error::Error for ReadRejected {}
 
 /// Common respones indicating success/failure respectively
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -63,6 +122,8 @@ pub struct FirehoseConfiguration {
     pub backend: QdlBackend,
     pub skip_firehose_log: bool,
     pub verbose_firehose: bool,
+    /// Suppress library logs and progress on the loader/storage paths.
+    pub quiet: bool,
 }
 
 impl Default for FirehoseConfiguration {
@@ -73,13 +134,33 @@ impl Default for FirehoseConfiguration {
             xml_buf_size: 4096,
             storage_sector_size: 512,
             storage_type: FirehoseStorageType::Emmc,
-            bypass_storage: true,
+            bypass_storage: false,
             hash_packets: false,
             read_back_verify: false,
             backend: QdlBackend::default(),
             skip_firehose_log: true,
             verbose_firehose: false,
+            quiet: false,
         }
+    }
+}
+
+impl FirehoseConfiguration {
+    /// Bound allocations and reject sizes that cannot make sector progress.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        const MAX_BUFFER: usize = 16 * 1024 * 1024;
+        if self.storage_sector_size == 0 || self.storage_sector_size > MAX_BUFFER {
+            bail!("Invalid storage sector size {}", self.storage_sector_size);
+        }
+        for size in [self.send_buffer_size, self.recv_buffer_size] {
+            if size == 0 || size > MAX_BUFFER || !size.is_multiple_of(self.storage_sector_size) {
+                bail!("Invalid sector-aligned payload size {size}");
+            }
+        }
+        if self.xml_buf_size == 0 || self.xml_buf_size > MAX_BUFFER {
+            bail!("Invalid XML buffer size {}", self.xml_buf_size);
+        }
+        Ok(())
     }
 }
 pub trait QdlChan: BufRead + Write {
@@ -96,6 +177,7 @@ where
 {
     pub rw: Box<T>,
     pub fh_cfg: FirehoseConfiguration,
+    /// Retained for source compatibility; ignored. Drop never sends commands.
     pub reset_on_drop: bool,
 }
 
@@ -144,24 +226,6 @@ where
 
     fn mut_fh_config(&mut self) -> &mut FirehoseConfiguration {
         &mut self.fh_cfg
-    }
-}
-
-impl<T> Drop for QdlDevice<T>
-where
-    T: QdlReadWrite + ?Sized,
-{
-    fn drop(&mut self) {
-        // Avoid having the board be stuck in EDL limbo in case of errors
-        // TODO: watch 'rawmode' and adjust accordingly
-        if self.reset_on_drop {
-            println!(
-                "Firehose {}. Resetting the board to {}, try again.",
-                "failed".bright_red(),
-                "edl".bright_yellow()
-            );
-            let _ = firehose_reset(self, &FirehoseResetMode::ResetToEdl, 0);
-        }
     }
 }
 

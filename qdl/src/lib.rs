@@ -9,15 +9,15 @@ use parsers::firehose_parser_ack_nak;
 use serde::{Deserialize, Serialize};
 use std::cmp::min;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::path::Path;
 use std::str::{self, FromStr};
-use types::FirehoseResetMode;
 use types::FirehoseStatus;
 use types::FirehoseStorageType;
 use types::QdlBackend;
 use types::QdlChan;
 use types::QdlReadWrite;
+use types::{FirehoseResetMode, MutationFailure, ReadRejected};
 
 use anyhow::bail;
 use pbr::{ProgressBar, Units};
@@ -158,6 +158,27 @@ pub fn load_programmer_images(path: impl AsRef<Path>) -> Result<Vec<Option<Vec<u
     Ok(vec![Some(blob)])
 }
 
+/// Open exactly one explicitly selected candidate. Enumeration never opens a device.
+pub fn select_and_open<T>(
+    keys: &[String],
+    requested: Option<&str>,
+    open: impl FnOnce(usize) -> Result<T>,
+) -> Result<T> {
+    let requested =
+        requested.with_context(|| format!("Select a device explicitly; candidates: {keys:?}"))?;
+    let mut matches = keys
+        .iter()
+        .enumerate()
+        .filter(|(_, key)| key.as_str() == requested);
+    let (index, _) = matches
+        .next()
+        .with_context(|| format!("No device matches {requested:?}; candidates: {keys:?}"))?;
+    if matches.next().is_some() {
+        bail!("Device selection {requested:?} is ambiguous");
+    }
+    open(index)
+}
+
 pub fn setup_target_device(
     backend: QdlBackend,
     _serial_no: Option<String>,
@@ -201,162 +222,185 @@ fn firehose_xml_setup(op: &str, kvps: &[(&str, &str)]) -> anyhow::Result<Vec<u8>
     Ok(buf)
 }
 
-/// Main Firehose XML reading function
-pub fn firehose_read<T: QdlChan>(
-    channel: &mut T,
-    response_parser: fn(&mut T, &IndexMap<String, String>) -> Result<FirehoseStatus, anyhow::Error>,
-) -> Result<FirehoseStatus, anyhow::Error> {
-    let mut got_any_data = false;
-    let mut pending: Vec<u8> = Vec::new();
-
+/// Read one XML document without consuming any following raw bytes or documents.
+fn firehose_read_xml<T: QdlChan>(channel: &mut T, welcome: bool) -> Result<Option<Element>> {
+    let limit = channel.fh_config().xml_buf_size;
+    if limit == 0 || limit > 16 * 1024 * 1024 {
+        bail!("Invalid XML receive limit {limit}");
+    }
+    let mut pending = Vec::new();
     loop {
-        // Use BufRead to peek at available data
         let available = match channel.fill_buf() {
             Ok(buf) => buf,
-            Err(e) => match e.kind() {
-                // In some cases (like with welcome messages), there's no acking
-                // and a timeout is the "end of data" marker instead..
-                std::io::ErrorKind::TimedOut if got_any_data => return Ok(FirehoseStatus::Ack),
-                std::io::ErrorKind::TimedOut => return Err(e.into()),
-                _ => return Err(e.into()),
-            },
+            Err(e) if welcome && pending.is_empty() && e.kind() == ErrorKind::TimedOut => {
+                return Ok(None);
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
         };
-
-        got_any_data = true;
-
-        // When channel is a non-packetized BufRead (e.g. serial) XML documents
-        // are not separated from each other, or from rawmode data. Search for
-        // </data> in the BufRead stream to find the end of the current
-        // message.
-        let data_end_marker = b"</data>";
-
-        let pending_length = pending.len();
-        pending.extend_from_slice(available);
-
-        // Search for the end marker in the pending data
-        let end_pos = pending
-            .windows(data_end_marker.len())
-            .position(|window| window == data_end_marker);
-
-        if let Some(pos) = end_pos {
-            let xml_end = pos + data_end_marker.len();
-
-            // xml_end is relative "pending", we need to consume only new the tail
-            channel.consume(xml_end - pending_length);
-
-            // Only parse the XML portion
-            let xml_chunk = &pending[..xml_end];
-            let xml = match xmltree::Element::parse(xml_chunk) {
-                Ok(x) => x,
-                Err(e) => {
-                    // Consume the bad data and continue
-                    bail!("Failed to parse XML: {}", e);
-                }
-            };
-
-            // The current message might have started in "pending", so clear it
-            // now. No need to do this if we're bailing above, as it's a local
-            // resource.
-            pending.clear();
-
+        if available.is_empty() {
+            return Err(
+                io::Error::new(ErrorKind::UnexpectedEof, "EOF before Firehose response").into(),
+            );
+        }
+        // Only welcome collection can discard whitespace between log documents.
+        // Command ACKs return before any following raw-storage bytes are consumed.
+        if welcome && pending.is_empty() {
+            let whitespace = available
+                .iter()
+                .take_while(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+                .count();
+            if whitespace != 0 {
+                channel.consume(whitespace);
+                continue;
+            }
+        }
+        // Copy only up to the document limit, including a possible split end marker.
+        let old_len = pending.len();
+        let copied = available.len().min(limit - old_len);
+        pending.extend_from_slice(&available[..copied]);
+        if let Some(pos) = pending.windows(7).position(|w| w == b"</data>") {
+            let end = pos + 7;
+            channel.consume(end - old_len);
+            let xml = Element::parse(&pending[..end]).context("Invalid Firehose XML")?;
             if xml.name != "data" {
-                // TODO: define a more verbose level
-                if channel.fh_config().verbose_firehose {
-                    println!("{:?}", xml);
-                }
-                bail!("Got a firehose packet without a data tag");
+                bail!("Got a Firehose packet without a data tag");
             }
-
-            // The spec expects there's always a single node only
-            if let Some(XMLNode::Element(e)) = xml.children.first() {
-                // Check for a 'log' node and print out the message
-                if e.name == "log" {
-                    // The last message within the initial logspam should be this
-                    // Try to match on it to not pay the USB xfer timeout penalty each time
-                    if let Some(val) = e.attributes.get_key_value("value")
-                        && val.1.starts_with("INFO: End of supported functions")
-                    {
-                        return Ok(FirehoseStatus::Ack);
-                    }
-                    if channel.fh_config().skip_firehose_log {
-                        continue;
-                    }
-
-                    println!(
-                        "LOG: {}",
-                        e.attributes
-                            .get("value")
-                            .to_owned()
-                            .unwrap_or(&String::from("<garbage log data>"))
-                            .bright_black()
-                    );
-
-                    continue;
-                }
-
-                // DEBUG: "print out incoming packets"
-                // TODO: define a more verbose level
-                if channel.fh_config().verbose_firehose {
-                    println!("RECV: {}", format!("{e:?}").magenta());
-                }
-
-                // TODO: Use std::intrinsics::unlikely after it exits nightly
-                if e.attributes.get("AttemptRetry").is_some() {
-                    // Restart the outer loop instead of recursing to avoid stack overflow
-                    got_any_data = false;
-                    continue;
-                } else if e.attributes.get("AttemptRestart").is_some() {
-                    // TODO: handle this automagically
-                    firehose_reset(channel, &FirehoseResetMode::ResetToEdl, 0)?;
-                    bail!("Firehose requested a restart. Run the program again.");
-                }
-
-                // Pass other nodes to specialized parsers
-                return response_parser(channel, &e.attributes);
-            }
-        } else {
-            // Didn't find the tail of the XML document in "pending" +
-            // "available", consume the data into "pending" to let fill_buf()
-            // read more data from the underlying Read.
-            let available_len = available.len();
-            channel.consume(available_len);
+            return Ok(Some(xml));
+        }
+        channel.consume(copied);
+        if pending.len() == limit {
+            bail!("Firehose XML exceeds receive limit {limit}");
         }
     }
 }
 
-/// Send a Firehose packet
-pub fn firehose_write<T: QdlChan>(channel: &mut T, buf: &mut [u8]) -> anyhow::Result<()> {
-    let mut b = buf.to_vec();
+/// Device-provided storage information, without parsing console output.
+#[derive(Debug)]
+pub struct FirehoseStorageInfo {
+    pub logs: Vec<String>,
+    pub attributes: IndexMap<String, String>,
+}
 
-    // XML can't be n * 512 bytes long by fh spec
-    if !buf.is_empty() && buf.len().is_multiple_of(512) {
-        println!("{}", "INFO: Appending '\n' to outgoing XML".bright_black());
-        b.push(b'\n');
+fn log_message<T: QdlChan>(channel: &T, node: &Element) -> String {
+    let message = node.attributes.get("value").cloned().unwrap_or_default();
+    if !channel.fh_config().quiet && !channel.fh_config().skip_firehose_log {
+        eprintln!("LOG: {message}");
     }
+    message
+}
 
-    match channel.write_all(&b) {
-        Ok(_) => Ok(()),
-        // Assume FH will hang after NAK..
-        Err(_) => firehose_reset(channel, &FirehoseResetMode::ResetToEdl, 0),
+fn firehose_response<T: QdlChan>(
+    channel: &mut T,
+    parser: fn(&mut T, &IndexMap<String, String>) -> Result<FirehoseStatus>,
+    collect_logs: bool,
+) -> Result<(FirehoseStatus, FirehoseStorageInfo)> {
+    let mut logs = Vec::new();
+    let mut log_bytes = 0usize;
+    loop {
+        let xml = firehose_read_xml(channel, false)?.context("Missing Firehose response")?;
+        let nodes: Vec<_> = xml
+            .children
+            .iter()
+            .filter_map(XMLNode::as_element)
+            .collect();
+        if nodes.len() != 1 {
+            bail!("Expected one Firehose response or log node");
+        }
+        let node = nodes[0];
+        if node.name == "log" {
+            let message = log_message(channel, node);
+            if collect_logs {
+                log_bytes += message.len();
+                if log_bytes > 16 * 1024 * 1024 {
+                    bail!("Storage information exceeds log limit");
+                }
+                logs.push(message);
+            }
+            continue;
+        }
+        if node.name != "response" {
+            bail!("Unexpected Firehose node {}", node.name);
+        }
+        let status = parser(channel, &node.attributes)?;
+        // Preserve a complete NAK, but never act on retry/restart hints.
+        if status != FirehoseStatus::Nak
+            && (node.attributes.contains_key("AttemptRetry")
+                || node.attributes.contains_key("AttemptRestart"))
+        {
+            bail!("Firehose requested retry/restart without NAK; session stopped");
+        }
+        if !channel.fh_config().quiet && channel.fh_config().verbose_firehose {
+            eprintln!("RECV: {node:?}");
+        }
+        return Ok((
+            status,
+            FirehoseStorageInfo {
+                logs,
+                attributes: node.attributes.clone(),
+            },
+        ));
     }
 }
 
-/// Send a Firehose packet and check for ack/nak
+/// Wait for a complete response. Logs and partial XML can never acknowledge a command.
+pub fn firehose_read<T: QdlChan>(
+    channel: &mut T,
+    response_parser: fn(&mut T, &IndexMap<String, String>) -> Result<FirehoseStatus>,
+) -> Result<FirehoseStatus> {
+    Ok(firehose_response(channel, response_parser, false)?.0)
+}
+
+/// Collect startup logs separately. Only an idle timeout at an XML boundary ends collection.
+pub fn firehose_read_welcome<T: QdlChan>(channel: &mut T) -> Result<Vec<String>> {
+    let mut logs = Vec::new();
+    let mut log_bytes = 0usize;
+    while let Some(xml) = firehose_read_xml(channel, true)? {
+        let nodes: Vec<_> = xml
+            .children
+            .iter()
+            .filter_map(XMLNode::as_element)
+            .collect();
+        if nodes.len() != 1 || nodes[0].name != "log" {
+            bail!("Expected a welcome log");
+        }
+        let message = log_message(channel, nodes[0]);
+        let done = message.starts_with("INFO: End of supported functions");
+        log_bytes += message.len();
+        if log_bytes > 16 * 1024 * 1024 {
+            bail!("Welcome logs exceed limit");
+        }
+        logs.push(message);
+        if done {
+            break;
+        }
+    }
+    Ok(logs)
+}
+
+/// Send XML and preserve the original transport failure. No recovery commands are sent.
+pub fn firehose_write<T: QdlChan>(channel: &mut T, buf: &mut [u8]) -> Result<()> {
+    let mut bytes = buf.to_vec();
+    if !bytes.is_empty() && bytes.len().is_multiple_of(512) {
+        bytes.push(b'\n');
+    }
+    channel.write_all(&bytes)?;
+    channel.flush()?;
+    Ok(())
+}
+
+/// Send a request and wait for its final ACK, retaining confirmation on failure.
 pub fn firehose_write_getack<T: QdlChan>(
     channel: &mut T,
     buf: &mut [u8],
     couldnt_what: String,
-) -> anyhow::Result<()> {
-    firehose_write(channel, buf)?;
-
-    match firehose_read::<T>(channel, firehose_parser_ack_nak) {
-        Ok(FirehoseStatus::Ack) => Ok(()),
-        Ok(FirehoseStatus::Nak) => {
-            // Assume FH will hang after NAK..
-            firehose_reset(channel, &FirehoseResetMode::ResetToEdl, 0)?;
-            Err(anyhow::Error::msg(format!("Couldn't {couldnt_what}")))
-        }
-        Err(e) => Err(e),
+) -> Result<(), MutationFailure> {
+    firehose_write(channel, buf).map_err(MutationFailure::unknown)?;
+    match firehose_read(channel, firehose_parser_ack_nak).map_err(MutationFailure::unknown)? {
+        FirehoseStatus::Ack => Ok(()),
+        FirehoseStatus::Nak => Err(MutationFailure::rejected(anyhow::anyhow!(
+            "Couldn't {couldnt_what}: NAK"
+        ))),
     }
 }
 
@@ -381,7 +425,7 @@ pub fn firehose_benchmark<T: QdlChan>(
         ],
     )?;
 
-    firehose_write_getack(channel, &mut xml, "issue a NOP".to_owned())
+    firehose_write_getack(channel, &mut xml, "issue a NOP".to_owned()).map_err(Into::into)
 }
 
 /// Send a "Hello"-type packet to the Device
@@ -390,18 +434,7 @@ pub fn firehose_configure<T: QdlChan>(
     skip_storage_init: bool,
 ) -> anyhow::Result<()> {
     let config = channel.fh_config();
-    // Spec requirement
-    assert!(
-        config
-            .send_buffer_size
-            .is_multiple_of(config.storage_sector_size)
-    );
-    // Sanity requirement
-    assert!(
-        config
-            .recv_buffer_size
-            .is_multiple_of(config.storage_sector_size)
-    );
+    config.validate()?;
     let mut xml = firehose_xml_setup(
         "configure",
         &[
@@ -431,15 +464,15 @@ pub fn firehose_configure<T: QdlChan>(
 pub fn firehose_nop<T: QdlChan>(channel: &mut T) -> anyhow::Result<()> {
     let mut xml = firehose_xml_setup("nop", &[("value", "ping")])?;
 
-    firehose_write_getack(channel, &mut xml, "issue a NOP".to_owned())
+    firehose_write_getack(channel, &mut xml, "issue a NOP".to_owned()).map_err(Into::into)
 }
 
 /// Get information about the physical partition of a storage medium (e.g. LUN)
-/// Prints to \<log\> only
+/// Returns raw log messages and response attributes.
 pub fn firehose_get_storage_info<T: QdlChan>(
     channel: &mut T,
     phys_part_idx: u8,
-) -> anyhow::Result<()> {
+) -> Result<FirehoseStorageInfo> {
     let mut xml = firehose_xml_setup(
         "getstorageinfo",
         &[("physical_partition_number", &phys_part_idx.to_string())],
@@ -447,7 +480,11 @@ pub fn firehose_get_storage_info<T: QdlChan>(
 
     firehose_write(channel, &mut xml)?;
 
-    firehose_read::<T>(channel, firehose_parser_ack_nak).and(Ok(()))
+    let (status, info) = firehose_response(channel, firehose_parser_ack_nak, true)?;
+    if status == FirehoseStatus::Nak {
+        bail!("Storage information request was NAKed");
+    }
+    Ok(info)
 }
 
 /// Alter Device (TODO: or Host) storage
@@ -459,7 +496,7 @@ pub fn firehose_patch<T: QdlChan>(
     size: u64,
     start_sector: &str,
     val: &str,
-) -> anyhow::Result<()> {
+) -> Result<(), MutationFailure> {
     let mut xml: Vec<u8> = firehose_xml_setup(
         "patch",
         &[
@@ -475,7 +512,8 @@ pub fn firehose_patch<T: QdlChan>(
             ("start_sector", start_sector),
             ("value", val),
         ],
-    )?;
+    )
+    .map_err(MutationFailure::not_sent)?;
 
     firehose_write_getack(channel, &mut xml, "patch".to_string())
 }
@@ -503,7 +541,7 @@ pub fn firehose_peek<T: QdlChan>(
         ],
     )?;
 
-    firehose_write_getack(channel, &mut xml, format!("peek @ {addr:#x}"))
+    firehose_write_getack(channel, &mut xml, format!("peek @ {addr:#x}")).map_err(Into::into)
 }
 
 /// Poke at memory
@@ -525,7 +563,7 @@ pub fn firehose_poke<T: QdlChan>(
         ],
     )?;
 
-    firehose_write_getack(channel, &mut xml, format!("poke @ {addr:#x}"))
+    firehose_write_getack(channel, &mut xml, format!("poke @ {addr:#x}")).map_err(Into::into)
 }
 
 /// Write to Device storage
@@ -537,8 +575,12 @@ pub fn firehose_program_storage<T: QdlChan>(
     slot: u8,
     phys_part_idx: u8,
     start_sector: &str,
-) -> anyhow::Result<()> {
-    let mut sectors_left = num_sectors;
+) -> Result<(), MutationFailure> {
+    let config = *channel.fh_config();
+    config.validate().map_err(MutationFailure::not_sent)?;
+    let mut bytes_left = num_sectors
+        .checked_mul(config.storage_sector_size)
+        .ok_or_else(|| MutationFailure::not_sent(anyhow::anyhow!("Program byte count overflow")))?;
     let mut xml = firehose_xml_setup(
         "program",
         &[
@@ -555,54 +597,57 @@ pub fn firehose_program_storage<T: QdlChan>(
                 &(channel.fh_config().read_back_verify as u32).to_string(),
             ),
         ],
-    )?;
+    )
+    .map_err(MutationFailure::not_sent)?;
 
-    firehose_write(channel, &mut xml)?;
-
-    if firehose_read::<T>(channel, firehose_parser_ack_nak)? != FirehoseStatus::Ack {
-        bail!("<program> was NAKed. Did you set sector-size correctly?");
-    }
-
-    let mut pb = ProgressBar::new((sectors_left * channel.fh_config().storage_sector_size) as u64);
-    pb.show_time_left = true;
-    pb.message(&format!("Sending partition {label}: "));
-    pb.set_units(Units::Bytes);
-
-    while sectors_left > 0 {
-        let chunk_size_sectors = min(
-            sectors_left,
-            channel.fh_config().send_buffer_size / channel.fh_config().storage_sector_size,
-        );
-        let mut buf = vec![
-            0u8;
-            min(
-                channel.fh_config().send_buffer_size,
-                chunk_size_sectors * channel.fh_config().storage_sector_size,
-            )
-        ];
-        let _ = data.read(&mut buf).unwrap();
-
-        let n = channel
-            .write(&buf)
-            .with_context(|| format!("Error sending data for partition {label}"))?;
-        if n != chunk_size_sectors * channel.fh_config().storage_sector_size {
-            bail!("Wrote an unexpected number of bytes ({})", n);
+    firehose_write_getack(channel, &mut xml, "start program".to_owned())?;
+    let mut pb = (!config.quiet).then(|| {
+        let mut pb = ProgressBar::new(bytes_left as u64);
+        pb.show_time_left = true;
+        pb.message(&format!("Sending partition {label}: "));
+        pb.set_units(Units::Bytes);
+        pb
+    });
+    let mut buf = vec![0; min(bytes_left, config.send_buffer_size)];
+    while bytes_left > 0 {
+        let len = min(bytes_left, buf.len());
+        data.read_exact(&mut buf[..len])
+            .with_context(|| format!("Error reading input for partition {label}"))
+            .map_err(MutationFailure::unknown)?;
+        if config.backend == QdlBackend::Usb {
+            // A USB short OUT completion must not be resumed as another packet.
+            let n = channel
+                .write(&buf[..len])
+                .map_err(MutationFailure::unknown)?;
+            if n != len {
+                return Err(MutationFailure::unknown(io::Error::new(
+                    ErrorKind::WriteZero,
+                    "Short USB data write",
+                )));
+            }
+        } else {
+            channel
+                .write_all(&buf[..len])
+                .map_err(MutationFailure::unknown)?;
         }
-
-        sectors_left -= chunk_size_sectors;
-        pb.add((chunk_size_sectors * channel.fh_config().storage_sector_size) as u64);
+        bytes_left -= len;
+        if let Some(pb) = &mut pb {
+            pb.add(len as u64);
+        }
     }
-
-    // Send a Zero-Length Packet to indicate end of stream
-    if channel.fh_config().backend == QdlBackend::Usb {
-        channel.write(&[]).context("Error sending ZLP")?;
+    if config.backend == QdlBackend::Usb {
+        channel
+            .write(&[])
+            .context("Error sending ZLP")
+            .map_err(MutationFailure::unknown)?;
     }
-
-    if firehose_read::<T>(channel, firehose_parser_ack_nak)? != FirehoseStatus::Ack {
-        bail!("Failed to complete 'write' op");
+    channel.flush().map_err(MutationFailure::unknown)?;
+    match firehose_read(channel, firehose_parser_ack_nak).map_err(MutationFailure::unknown)? {
+        FirehoseStatus::Ack => Ok(()),
+        FirehoseStatus::Nak => Err(MutationFailure::rejected(anyhow::anyhow!(
+            "Program completion was NAKed"
+        ))),
     }
-
-    Ok(())
 }
 
 /// Get a SHA256 digest of a portion of Device storage
@@ -644,7 +689,11 @@ pub fn firehose_read_storage(
     phys_part_idx: u8,
     start_sector: u64,
 ) -> anyhow::Result<()> {
-    let mut bytes_left = num_sectors * channel.fh_config().storage_sector_size;
+    let config = *channel.fh_config();
+    config.validate()?;
+    let mut bytes_left = num_sectors
+        .checked_mul(config.storage_sector_size)
+        .context("Read byte count overflow")?;
     let mut xml = firehose_xml_setup(
         "read",
         &[
@@ -660,38 +709,42 @@ pub fn firehose_read_storage(
     )?;
 
     firehose_write(channel, &mut xml)?;
-    if firehose_read(channel, firehose_parser_ack_nak)? != FirehoseStatus::Ack {
-        bail!("Read request was NAKed");
-    }
-
-    let mut pb = ProgressBar::new(bytes_left as u64);
-    pb.set_units(Units::Bytes);
-
-    let mut last_read_was_zero_len = false;
-    while bytes_left > 0 {
-        let chunk_size_bytes = min(bytes_left, channel.fh_config().recv_buffer_size);
-        let mut buf = vec![0; chunk_size_bytes];
-
-        let n = channel.read(&mut buf).context("Error receiving data")?;
-        if n == 0 {
-            // TODO: need more robustness here
-            /* Every 2 or 3 packets should be empty? */
-            last_read_was_zero_len = true;
-            continue;
+    let (status, response) = firehose_response(channel, firehose_parser_ack_nak, false)?;
+    if status == FirehoseStatus::Nak {
+        let attrs = &response.attributes;
+        if attrs.contains_key("AttemptRestart")
+            || attrs.contains_key("AttemptRetry")
+            || attrs.get("rawmode").is_some_and(|mode| mode != "false")
+        {
+            bail!("Read was NAKed without a usable command boundary: {attrs:?}");
         }
+        return Err(ReadRejected.into());
+    }
 
-        last_read_was_zero_len = false;
-        let _ = out.write(&buf[..n])?;
-
+    let mut pb = (!config.quiet).then(|| {
+        let mut pb = ProgressBar::new(bytes_left as u64);
+        pb.set_units(Units::Bytes);
+        pb
+    });
+    let mut buf = vec![0; min(bytes_left, config.recv_buffer_size)];
+    while bytes_left > 0 {
+        let len = min(bytes_left, buf.len());
+        let n = match channel.read(&mut buf[..len]) {
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            result => result.context("Error receiving data")?,
+        };
+        if n == 0 {
+            return Err(io::Error::new(ErrorKind::UnexpectedEof, "EOF in storage data").into());
+        }
+        out.write_all(&buf[..n])
+            .context("Error writing storage output")?;
         bytes_left -= n;
-        pb.add(n as u64);
+        if let Some(pb) = &mut pb {
+            pb.add(n as u64);
+        }
     }
-
-    if !last_read_was_zero_len && channel.fh_config().backend == QdlBackend::Usb {
-        // Issue a dummy read to drain the queue
-        let _ = channel.read(&mut [])?;
-    }
-
+    out.flush().context("Error flushing storage output")?;
+    // nusb's streaming reader consumes USB packet delimiters itself.
     if firehose_read(channel, firehose_parser_ack_nak)? != FirehoseStatus::Ack {
         bail!("Failed to complete 'read' op");
     }
@@ -704,7 +757,7 @@ pub fn firehose_reset<T: QdlChan>(
     channel: &mut T,
     mode: &FirehoseResetMode,
     delay_in_sec: u32,
-) -> anyhow::Result<()> {
+) -> Result<(), MutationFailure> {
     let mut xml = firehose_xml_setup(
         "power",
         &[
@@ -718,22 +771,24 @@ pub fn firehose_reset<T: QdlChan>(
             ),
             ("DelayInSeconds", &delay_in_sec.to_string()),
         ],
-    )?;
+    )
+    .map_err(MutationFailure::not_sent)?;
 
     firehose_write_getack(channel, &mut xml, "reset the Device".to_owned())?;
-
-    // Drain the incoming LOG packets to actually restart the device
-    let _ = channel.skip_until(0);
 
     Ok(())
 }
 
 /// Mark a physical storage partition as bootable
-pub fn firehose_set_bootable<T: QdlChan>(channel: &mut T, drive_idx: u8) -> anyhow::Result<()> {
+pub fn firehose_set_bootable<T: QdlChan>(
+    channel: &mut T,
+    drive_idx: u8,
+) -> Result<(), MutationFailure> {
     let mut xml = firehose_xml_setup(
         "setbootablestoragedrive",
         &[("value", &drive_idx.to_string())],
-    )?;
+    )
+    .map_err(MutationFailure::not_sent)?;
 
     firehose_write_getack(
         channel,

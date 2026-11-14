@@ -274,3 +274,5 @@ See the [`LICENSE` file](/LICENSE).
 ## Credits
 
 * [linux-msm/qdl](https://github.com/linux-msm/qdl) for the open C implementation
+
+Loader-mode Sahara sessions reject memory-debug, command-mode, and unsolicited reset-response packets before issuing responses or creating files. Explicit memory-debug workflows remain separate.

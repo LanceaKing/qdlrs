@@ -39,7 +39,7 @@ The protocol implementation. Exposes everything the CLI and ramdump tools need.
 
 - **`src/types.rs`** — shared traits and structs. `QdlReadWrite` is the raw transport trait. `QdlDevice<T>` wraps it with a `FirehoseConfiguration` and implements `QdlChan`. `QdlChan: BufRead + Write` is what all Firehose functions accept. `QdlDevice` never sends commands on `Drop`. The retained `reset_on_drop` field is ignored. Modifying paths return `MutationFailure`, with a confirmation state and the original error.
 - **`src/lib.rs`** — all Firehose XML protocol functions (`firehose_configure`, `firehose_program_storage`, `firehose_read_storage`, `firehose_reset`, etc.). Also contains `load_programmer_images`, which handles both plain ELF loaders and CPIO `newc` multi-image archives (used on newer platforms like SM8750 with `xbl_s_devprg_ns.melf`).
-- **`src/sahara.rs`** — Sahara binary protocol (the first stage before Firehose). `sahara_run` drives the full state machine; `sahara_dump_regions` handles crash ramdumps.
+- **`src/sahara.rs`** — Sahara binary protocol (the first stage before Firehose). `sahara_load_programmer` is the loader-only product entry point. `sahara_run` drives the full state machine; WaitingForImage rejects command/debug/reset-response messages before side effects; `sahara_dump_regions` handles crash ramdumps.
 - **`src/parsers.rs`** — XML response parsers for Firehose ACK/NAK and configure responses.
 - **`src/usb.rs`** / **`src/serial.rs`** — transport backends, compiled in via `features = ["usb", "serial"]`. USB uses `nusb`; serial uses `serial2`. On Windows, serial is the default backend.
 

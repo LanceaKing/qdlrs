@@ -184,3 +184,28 @@ fn invalid_completion_status_never_reports_loader_success() {
     assert!(run(&mut dev, &mut [Some(vec![0; 8])]).is_err());
     assert!(trace.lock().unwrap().writes.is_empty());
 }
+
+#[test]
+fn loader_rejects_debug_command_and_reset_packets_before_side_effects() {
+    for unexpected in [
+        packet(0x10, &[0, 0, u32::MAX, u32::MAX]), // Debug table: must not allocate/read it.
+        packet(0x0b, &[]),
+        packet(0x0e, &[1, u32::MAX]),
+        packet(0x08, &[]),
+    ] {
+        for hello_first in [false, true] {
+            let mut input = Vec::new();
+            if hello_first {
+                input.push(bytes(&packet(1, &[2, 1, 4096, 0, 0, 0, 0, 0, 0, 0])));
+            }
+            input.push(bytes(&unexpected));
+            let (mut dev, trace) = device(input);
+            assert!(run(&mut dev, &mut [Some(vec![1])]).is_err());
+            drop(dev);
+            // No memory-read, execute, reset, or follow-up command. An optional
+            // hello response is the only permitted outbound packet.
+            assert_eq!(trace.lock().unwrap().writes.len(), usize::from(hello_first));
+            assert_no_reset(&trace);
+        }
+    }
+}

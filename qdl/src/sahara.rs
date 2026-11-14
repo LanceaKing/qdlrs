@@ -508,6 +508,23 @@ fn sahara_read_packet<T: Read>(channel: &mut T, verbose: bool) -> Result<SaharaP
     sahara_parse_packet(&packet, verbose)
 }
 
+/// Loader-only entry point. The state machine rejects commands outside image
+/// transfer before performing their side effects.
+pub fn sahara_load_programmer<T: QdlChan>(
+    channel: &mut T,
+    images: &mut [Option<Vec<u8>>],
+) -> Result<()> {
+    sahara_run(
+        channel,
+        SaharaMode::WaitingForImage,
+        None,
+        images,
+        vec![],
+        false,
+    )?;
+    Ok(())
+}
+
 pub fn sahara_run<T: QdlChan>(
     channel: &mut T,
     sahara_mode: SaharaMode,
@@ -519,6 +536,21 @@ pub fn sahara_run<T: QdlChan>(
     let verbose = verbose && !channel.fh_config().quiet;
     loop {
         let pkt = sahara_read_packet(channel, verbose)?;
+
+        // Loading a programmer must not enter command or memory-dump workflows.
+        // Reject before any response, memory allocation, or output file creation.
+        if sahara_mode == SaharaMode::WaitingForImage
+            && !matches!(
+                pkt.cmd,
+                SaharaCmd::SaharaHello
+                    | SaharaCmd::SaharaReadData
+                    | SaharaCmd::SaharaReadData64
+                    | SaharaCmd::SaharaEndOfImage
+                    | SaharaCmd::SaharaDoneResp
+            )
+        {
+            bail!("Unexpected {:?} in loader mode", pkt.cmd);
+        }
 
         match pkt.cmd {
             SaharaCmd::SaharaHello => {

@@ -66,7 +66,7 @@ Connects to a crashed device, runs Sahara in memory-debug mode, and dumps select
 - **Read rejection**: `ReadRejected` requires an initial complete NAK with no retry/restart hint and `rawmode` absent or `false`. Other read failures require stopping the session.
 - **Input and configuration**: Program callers supply every requested sector byte, including any permitted tail padding. The default configuration uses `SkipWrite=0`. Invalid or zero payload sizes return errors. Configuration parsing does not send follow-up commands.
 - **Output**: Product callers set `FirehoseConfiguration::quiet`. This suppresses logs and progress on loader/storage paths. Startup logs use `firehose_read_welcome`, while command responses use `firehose_read`. Storage information is returned as data.
-- **XML framing on serial**: Firehose XML packets aren't naturally delimited over serial; `firehose_read` scans for `</data>` to find message boundaries rather than relying on packet framing.
+- **XML framing on serial**: Firehose XML packets aren't naturally delimited over serial; `firehose_read` skips XML whitespace before a document and scans for `</data>` to find its end. It leaves bytes after that boundary untouched, including raw storage data. A welcome end marker can return immediately without consuming trailing whitespace; the next XML read handles it. Command timeouts still fail.
 
 ## Keeping this file current
 

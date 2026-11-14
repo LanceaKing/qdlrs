@@ -441,6 +441,118 @@ fn welcome_end_marker_does_not_acknowledge_a_command() {
     assert_eq!(firehose_read_welcome(&mut dev).unwrap().len(), 1);
 }
 
+const WELCOME_END: &[u8] = b"<data><log value=\"INFO: End of supported functions\"/></data>";
+const XML_DECLARATION: &[u8] = b"<?xml version=\"1.0\"?>";
+
+#[test]
+fn welcome_handoff_accepts_declared_configure_response_at_every_split() {
+    let stream = [WELCOME_END, b"\r\n \t", XML_DECLARATION, CONFIG, ACK].concat();
+    let mut fragments = vec![vec![bytes(&stream)]];
+    fragments.extend(
+        (1..stream.len()).map(|split| vec![bytes(&stream[..split]), bytes(&stream[split..])]),
+    );
+    fragments.push(stream.iter().map(|byte| bytes(&[*byte])).collect());
+    for input in fragments {
+        let (mut dev, trace) = device(input);
+        assert_eq!(firehose_read_welcome(&mut dev).unwrap().len(), 1);
+        assert!(trace.lock().unwrap().writes.is_empty());
+        firehose_configure(&mut dev, false).unwrap();
+        assert_eq!(
+            firehose_read(&mut dev, firehose_parser_configure_response).unwrap(),
+            FirehoseStatus::Ack
+        );
+        assert_eq!(dev.fh_cfg.send_buffer_size, 8);
+        assert_eq!(
+            firehose_read(&mut dev, firehose_parser_ack_nak).unwrap(),
+            FirehoseStatus::Ack
+        );
+        drop(dev);
+        assert_eq!(trace.lock().unwrap().writes.len(), 1);
+        assert_no_reset(&trace);
+    }
+}
+
+#[test]
+fn welcome_handoff_preserves_raw_whitespace_at_every_split() {
+    let raw = b" \t\r\n \t\r\n";
+    let stream = [
+        WELCOME_END,
+        b"\r\n",
+        XML_DECLARATION,
+        ACK,
+        raw,
+        b"\r\n",
+        XML_DECLARATION,
+        ACK,
+        NAK,
+    ]
+    .concat();
+    for split in 1..stream.len() {
+        let (mut dev, trace) = device([bytes(&stream[..split]), bytes(&stream[split..])]);
+        assert_eq!(firehose_read_welcome(&mut dev).unwrap().len(), 1);
+        let mut out = Vec::new();
+        firehose_read_storage(&mut dev, &mut out, 2, 0, 0, 0).unwrap();
+        assert_eq!(out, raw, "split={split}");
+        assert_eq!(
+            firehose_read(&mut dev, firehose_parser_ack_nak).unwrap(),
+            FirehoseStatus::Nak
+        );
+        drop(dev);
+        assert_eq!(trace.lock().unwrap().writes.len(), 1);
+        assert_no_reset(&trace);
+    }
+}
+
+#[test]
+fn welcome_handoff_whitespace_and_partial_xml_never_acknowledge_a_command() {
+    for tail in [
+        &b" \t\r\n"[..],
+        &b"\r\n<?xml version=\"1.0\"?><data><response"[..],
+    ] {
+        for (ending, kind) in [
+            (Input::Error(ErrorKind::TimedOut), ErrorKind::TimedOut),
+            (Input::Eof, ErrorKind::UnexpectedEof),
+        ] {
+            let (mut dev, trace) = device([bytes(&[WELCOME_END, tail].concat()), ending]);
+            assert_eq!(firehose_read_welcome(&mut dev).unwrap().len(), 1);
+            assert_eq!(
+                io_kind(&firehose_read(&mut dev, firehose_parser_ack_nak).unwrap_err()),
+                kind
+            );
+            drop(dev);
+            assert!(trace.lock().unwrap().writes.is_empty());
+        }
+    }
+}
+
+#[test]
+fn welcome_handoff_rejects_non_xml_whitespace_and_malformed_documents() {
+    for tail in [
+        &b"\r\n\x0b<data><response value=\"ACK\"/></data>"[..],
+        &b"\r\n\x0c<data><response value=\"ACK\"/></data>"[..],
+        &b"\r\n<?xml version=\"1.0\"?><data><response value=\"ACK\"></data>"[..],
+    ] {
+        let (mut dev, _) = device([bytes(&[WELCOME_END, tail].concat())]);
+        assert_eq!(firehose_read_welcome(&mut dev).unwrap().len(), 1);
+        assert!(firehose_read(&mut dev, firehose_parser_ack_nak).is_err());
+    }
+}
+
+#[test]
+fn response_prefix_whitespace_preserves_xml_size_limit() {
+    let declared_ack = [XML_DECLARATION, ACK].concat();
+    for (limit, success) in [(declared_ack.len(), true), (declared_ack.len() - 1, false)] {
+        let (mut dev, _) = device([bytes(&[&b" \t\r\n"[..], &declared_ack].concat())]);
+        dev.fh_cfg.xml_buf_size = limit;
+        let result = firehose_read(&mut dev, firehose_parser_ack_nak);
+        if success {
+            assert_eq!(result.unwrap(), FirehoseStatus::Ack);
+        } else {
+            assert!(result.unwrap_err().to_string().contains("receive limit"));
+        }
+    }
+}
+
 #[test]
 fn welcome_timeout_only_completes_at_document_boundary() {
     let (mut dev, _) = device([bytes(LOG), Input::Error(ErrorKind::TimedOut)]);

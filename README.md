@@ -30,7 +30,8 @@ Only a complete NAK before raw data, without retry/restart hints or a raw-mode i
 An absent `rawmode` attribute or `rawmode="false"` permits this classification. Other read failures require stopping the session.
 
 `firehose_read_welcome` collects startup logs. An idle timeout ends welcome collection only at an XML document boundary.
-XML whitespace between welcome documents or after a complete welcome document is allowed. Partial XML still fails on timeout.
+XML reads skip framing whitespace before the next document, including whitespace left by the welcome end marker.
+They return immediately at the document end, preserving raw storage bytes after an ACK. Partial XML still fails on timeout.
 `firehose_read` requires a complete response, even after a log or partial XML.
 `firehose_get_storage_info` returns log messages and response attributes, and reports NAK as an error.
 Configuration responses update sizes only after a valid ACK. They do not send another configure or reset command.

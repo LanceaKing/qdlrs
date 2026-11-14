@@ -243,9 +243,10 @@ fn firehose_read_xml<T: QdlChan>(channel: &mut T, welcome: bool) -> Result<Optio
                 io::Error::new(ErrorKind::UnexpectedEof, "EOF before Firehose response").into(),
             );
         }
-        // Only welcome collection can discard whitespace between log documents.
-        // Command ACKs return before any following raw-storage bytes are consumed.
-        if welcome && pending.is_empty() {
+        // XML framing whitespace can remain after the welcome end marker or a
+        // preceding response. Skip it only before the next XML document; return
+        // at </data> so raw-storage bytes after an ACK remain untouched.
+        if pending.is_empty() {
             let whitespace = available
                 .iter()
                 .take_while(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
@@ -351,7 +352,7 @@ pub fn firehose_read<T: QdlChan>(
     Ok(firehose_response(channel, response_parser, false)?.0)
 }
 
-/// Collect startup logs separately. Only an idle timeout at an XML boundary ends collection.
+/// Collect startup logs until their end marker or an idle timeout at an XML boundary.
 pub fn firehose_read_welcome<T: QdlChan>(channel: &mut T) -> Result<Vec<String>> {
     let mut logs = Vec::new();
     let mut log_bytes = 0usize;

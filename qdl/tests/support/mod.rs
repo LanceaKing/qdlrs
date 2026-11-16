@@ -148,3 +148,41 @@ pub fn assert_no_reset(trace: &Trace) {
         assert!(!data.contains(forbidden), "unexpected command: {data}");
     }
 }
+
+pub fn disk(sector: usize, names: &[&str]) -> Vec<u8> {
+    let mut disk = std::io::Cursor::new(vec![0; 256 * sector]);
+    let mut gpt = gptman::GPT::new_from(&mut disk, sector as u64, [42; 16]).unwrap();
+    for (index, name) in names.iter().enumerate() {
+        gpt[(index + 1) as u32] = gptman::GPTPartitionEntry {
+            partition_type_guid: [1; 16],
+            unique_partition_guid: [index as u8 + 1; 16],
+            starting_lba: 64 + index as u64 * 4,
+            ending_lba: 65 + index as u64 * 4,
+            attribute_bits: 0,
+            partition_name: (*name).into(),
+        };
+    }
+    gpt.write_into(&mut disk).unwrap();
+    disk.into_inner()
+}
+pub fn gpt_script(disk: &[u8], sector: usize) -> Vec<Input> {
+    let h = gptman::GPTHeader::read_from(&mut std::io::Cursor::new(&disk[sector..])).unwrap();
+    vec![
+        bytes(ACK),
+        bytes(&disk[sector..2 * sector]),
+        bytes(ACK),
+        bytes(ACK),
+        bytes(&disk[..h.first_usable_lba as usize * sector]),
+        bytes(ACK),
+    ]
+}
+pub fn storage_device(
+    input: impl IntoIterator<Item = Input>,
+    sector: usize,
+) -> (QdlDevice<ScriptedIo>, Trace) {
+    let (mut dev, trace) = device(input);
+    dev.fh_cfg.storage_sector_size = sector;
+    dev.fh_cfg.send_buffer_size = 4096;
+    dev.fh_cfg.recv_buffer_size = 4096;
+    (dev, trace)
+}

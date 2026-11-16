@@ -384,6 +384,7 @@ dependencies = [
  "anstream",
  "anyhow",
  "bincode",
+ "gptman",
  "indexmap",
  "nusb",
  "owo-colors",

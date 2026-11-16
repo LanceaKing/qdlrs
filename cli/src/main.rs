@@ -343,17 +343,14 @@ fn main() -> Result<()> {
         }
         Command::Erase { name } => {
             let part = find_part(&mut qdl_dev, &name, args.storage_slot, args.phys_part_idx)?;
-            let num_sectors = usize::try_from(part.size()?)?;
-            let mut data = zero_input(num_sectors, qdl_dev.fh_cfg.storage_sector_size)?;
-
-            firehose_program_storage(
+            let source_bytes = part.bytes()?;
+            let mut data = zero_input(usize::try_from(part.sectors)?, part.sector_size)?;
+            qdl::storage::program_partition(
                 &mut qdl_dev,
+                &part,
                 &mut data,
-                &name,
-                num_sectors,
+                source_bytes,
                 args.storage_slot,
-                args.phys_part_idx,
-                &part.starting_lba.to_string(),
             )?;
         }
         Command::Flasher {
@@ -406,38 +403,20 @@ fn main() -> Result<()> {
             part_name,
             file_path,
         } => {
-            let part: gptman::GPTPartitionEntry = find_part(
+            let part = find_part(
                 &mut qdl_dev,
                 &part_name,
                 args.storage_slot,
                 args.phys_part_idx,
             )?;
-            let mut file = ProgramInput::from_file(
-                File::open(file_path)?,
-                qdl_dev.fh_cfg.storage_sector_size,
-                0,
-                None,
-            )?;
-            let file_len_sectors = file.num_sectors();
-            let part_len_sectors = part.size()?;
-
-            if file_len_sectors as u64 > part_len_sectors {
-                bail!(
-                    "Partition {} is too small for the specified image ({} > {})",
-                    part_name,
-                    file_len_sectors,
-                    part_len_sectors
-                );
-            }
-
-            firehose_program_storage(
+            let mut file = File::open(file_path)?;
+            let source_bytes = file.metadata()?.len();
+            qdl::storage::program_partition(
                 &mut qdl_dev,
+                &part,
                 &mut file,
-                &part_name,
-                file_len_sectors,
+                source_bytes,
                 args.storage_slot,
-                args.phys_part_idx,
-                &part.starting_lba.to_string(),
             )?;
         }
     };

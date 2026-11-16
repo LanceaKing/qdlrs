@@ -27,6 +27,7 @@ pub mod parsers;
 pub mod sahara;
 #[cfg(feature = "serial")]
 pub mod serial;
+pub mod storage;
 pub mod types;
 #[cfg(feature = "usb")]
 pub mod usb;

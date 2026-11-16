@@ -276,3 +276,21 @@ See the [`LICENSE` file](/LICENSE).
 * [linux-msm/qdl](https://github.com/linux-msm/qdl) for the open C implementation
 
 Loader-mode Sahara sessions reject memory-debug, command-mode, and unsolicited reset-response packets before issuing responses or creating files. Explicit memory-debug workflows remain separate.
+
+## Shared storage API
+
+`qdl::storage` owns primary GPT reads, validation, partition lookup, and partition transfers.
+GPT reads accept 512-byte and 4096-byte sectors and limit primary metadata to 16 MiB.
+The library rejects changed headers, invalid ranges, overlapping partitions, and ambiguous names.
+These limits reject unsupported layouts. They do not prove the physical capacity of the device.
+
+`read_gpt`, `read_partition`, and `program_partition` accept an explicit storage slot.
+`read_gpt_with` and `read_partition_with` accept read callbacks for capture or transport adapters.
+Callbacks must transfer the requested range and check command completion.
+GPT callbacks must append the exact requested byte count and preserve the allocation bound.
+
+`program_partition` rejects empty or oversized images before sending a command.
+It pads only the last sector and rejects an early source EOF.
+Callers retain file naming, partial files, reports, readback policy, and session stop policy.
+The CLI uses this API for GPT access and named partition operations.
+Offline coverage lives in `qdl/tests/storage.rs` and `cli/tests/storage.rs`.

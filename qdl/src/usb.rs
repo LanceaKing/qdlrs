@@ -15,11 +15,54 @@ use crate::{select_and_open, types::QdlReadWrite};
 
 pub struct QdlUsbConfig {
     _dev: nusb::Device,
-    reader: EndpointRead<nusb::transfer::Bulk>,
+    reader: EndpointRead<Bulk>,
     writer: Endpoint<Bulk, Out>,
-    buf: Vec<u8>,
+    receive: ReceiveBuffer,
+}
+
+#[derive(Default)]
+struct ReceiveBuffer {
+    bytes: Vec<u8>,
     pos: usize,
     cap: usize,
+}
+
+impl ReceiveBuffer {
+    fn fill(
+        &mut self,
+        read: impl FnOnce(&mut [u8]) -> std::io::Result<usize>,
+    ) -> std::io::Result<&[u8]> {
+        if self.pos == self.cap {
+            self.pos = 0;
+            self.cap = 0;
+            if self.bytes.is_empty() {
+                self.bytes.resize(4096, 0);
+            }
+            self.cap = read(&mut self.bytes).map_err(usb_read_error)?;
+        }
+        Ok(&self.bytes[self.pos..self.cap])
+    }
+
+    fn fill_response(
+        &mut self,
+        read: impl FnOnce(&mut [u8]) -> std::io::Result<usize>,
+    ) -> std::io::Result<&[u8]> {
+        self.fill(|out| match read(out)? {
+            0 => Err(ErrorKind::Interrupted.into()),
+            n => Ok(n),
+        })
+    }
+
+    fn copy_into(&mut self, out: &mut [u8]) -> usize {
+        let n = out.len().min(self.cap - self.pos);
+        out[..n].copy_from_slice(&self.bytes[self.pos..self.pos + n]);
+        self.pos += n;
+        n
+    }
+
+    fn consume(&mut self, amount: usize) {
+        self.pos += amount.min(self.cap - self.pos);
+    }
 }
 
 // Use completions directly: EndpointWrite 0.2.1 does not check actual_len.
@@ -81,40 +124,38 @@ impl Read for QdlUsbConfig {
         if out.is_empty() {
             return Ok(0);
         }
-        // Drain internal buffer first
-        if self.pos < self.cap {
-            let n = std::cmp::min(out.len(), self.cap - self.pos);
-            out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
-            self.pos += n;
+        let n = self.receive.copy_into(out);
+        if n != 0 {
             return Ok(n);
         }
-        // Otherwise, read directly from USB
         self.reader.read(out).map_err(usb_read_error)
     }
 }
 
 impl BufRead for QdlUsbConfig {
     fn fill_buf(&mut self) -> Result<&[u8], std::io::Error> {
-        if self.pos >= self.cap {
-            self.pos = 0;
-            self.cap = 0;
-            if self.buf.is_empty() {
-                self.buf.resize(4096, 0);
-            }
-            {
-                let n = self.reader.read(&mut self.buf).map_err(usb_read_error)?;
-                self.cap = n;
-            }
-        }
-        Ok(&self.buf[self.pos..self.cap])
+        self.receive.fill(|out| self.reader.read(out))
     }
 
     fn consume(&mut self, amt: usize) {
-        self.pos = std::cmp::min(self.pos + amt, self.cap);
+        self.receive.consume(amt);
     }
 }
 
-impl QdlReadWrite for QdlUsbConfig {}
+impl QdlReadWrite for QdlUsbConfig {
+    fn fill_response_buf(&mut self) -> std::io::Result<&[u8]> {
+        self.receive.fill_response(|out| {
+            // The streaming reader skips empty completions internally. Observe the
+            // delimiter here so the XML parser can check its deadline before retrying.
+            let mut packet = self.reader.until_short_packet();
+            let n = packet.read(out)?;
+            if n == 0 {
+                packet.consume_end().map_err(Error::other)?;
+            }
+            Ok(n)
+        })
+    }
+}
 
 const USB_VID_QCOM: u16 = 0x05c6;
 const USB_PID_EDL: [u16; 2] = [0x9008 /* EDL */, 0x900e /* Ramdump */];
@@ -215,9 +256,7 @@ fn setup_usb_device_from_device(dev: Device) -> Result<QdlUsbConfig> {
         _dev: dev,
         reader: rd,
         writer: wr,
-        buf: Vec::new(),
-        pos: 0,
-        cap: 0,
+        receive: ReceiveBuffer::default(),
     })
 }
 
@@ -268,5 +307,57 @@ mod tests {
                 .kind(),
             ErrorKind::TimedOut
         );
+    }
+
+    #[test]
+    fn empty_response_completion_yields_and_following_bytes_are_shared() {
+        let mut receive = ReceiveBuffer::default();
+        let empty = receive.fill_response(|_| Ok(0)).unwrap_err();
+        assert_eq!(empty.kind(), ErrorKind::Interrupted);
+
+        let bytes = receive
+            .fill_response(|out| {
+                out[..6].copy_from_slice(b"xmlraw");
+                Ok(6)
+            })
+            .unwrap();
+        assert_eq!(bytes, b"xmlraw");
+        receive.consume(3);
+        assert_eq!(
+            receive
+                .fill(|_| panic!("unconsumed bytes need no refill"))
+                .unwrap(),
+            b"raw"
+        );
+        let mut raw = [0; 3];
+        assert_eq!(receive.copy_into(&mut raw), raw.len());
+        assert_eq!(&raw, b"raw");
+        assert_eq!(receive.copy_into(&mut raw), 0);
+    }
+
+    #[test]
+    fn response_refill_preserves_reported_transport_errors() {
+        let mut receive = ReceiveBuffer::default();
+        let timeout = receive
+            .fill_response(|_| Err(ErrorKind::TimedOut.into()))
+            .unwrap_err();
+        assert_eq!(timeout.kind(), ErrorKind::TimedOut);
+        let cancelled = receive
+            .fill_response(|_| Err(TransferError::Cancelled.into()))
+            .unwrap_err();
+        assert_eq!(cancelled.kind(), ErrorKind::TimedOut);
+        let original = cancelled
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<Error>()
+            .unwrap();
+        assert_eq!(
+            original.get_ref().unwrap().downcast_ref::<TransferError>(),
+            Some(&TransferError::Cancelled)
+        );
+        let disconnected = receive
+            .fill_response(|_| Err(TransferError::Disconnected.into()))
+            .unwrap_err();
+        assert_eq!(disconnected.kind(), ErrorKind::ConnectionAborted);
     }
 }

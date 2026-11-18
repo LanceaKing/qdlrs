@@ -2,7 +2,7 @@
 // Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 use std::{
     fmt::Display,
-    io::{BufRead, ErrorKind, Read, Write},
+    io::{self, BufRead, ErrorKind, Read, Write},
     str::FromStr,
 };
 
@@ -166,10 +166,41 @@ impl FirehoseConfiguration {
 pub trait QdlChan: BufRead + Write {
     fn fh_config(&self) -> &FirehoseConfiguration;
     fn mut_fh_config(&mut self) -> &mut FirehoseConfiguration;
+
+    /// Return buffered bytes or perform one receive attempt for Firehose XML.
+    ///
+    /// Consume these bytes with the same `BufRead::consume` used for other reads.
+    /// An empty slice indicates EOF. Use `Interrupted` for a retryable attempt
+    /// that yielded no bytes, so the parser can check its deadline before retrying.
+    /// Channel adapters must forward both response methods to their inner channel.
+    fn fill_response_buf(&mut self) -> io::Result<&[u8]> {
+        self.fill_buf()
+    }
+
+    /// Check a caller-owned deadline while waiting for Firehose XML.
+    ///
+    /// Returning an error fails the outstanding exchange. This hook runs before and
+    /// after response reads and after complete logs. Raw I/O does not call it.
+    fn check_response_wait(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
-pub trait QdlReadWrite: BufRead + Write + Send + Sync {}
-impl<T> QdlReadWrite for &mut T where T: QdlReadWrite + ?Sized {}
+pub trait QdlReadWrite: BufRead + Write + Send + Sync {
+    /// Transport implementation of [`QdlChan::fill_response_buf`].
+    fn fill_response_buf(&mut self) -> io::Result<&[u8]> {
+        self.fill_buf()
+    }
+}
+
+impl<T> QdlReadWrite for &mut T
+where
+    T: QdlReadWrite + ?Sized,
+{
+    fn fill_response_buf(&mut self) -> io::Result<&[u8]> {
+        (**self).fill_response_buf()
+    }
+}
 
 pub struct QdlDevice<T>
 where
@@ -226,6 +257,10 @@ where
 
     fn mut_fh_config(&mut self) -> &mut FirehoseConfiguration {
         &mut self.fh_cfg
+    }
+
+    fn fill_response_buf(&mut self) -> io::Result<&[u8]> {
+        self.rw.fill_response_buf()
     }
 }
 

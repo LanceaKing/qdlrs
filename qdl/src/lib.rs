@@ -225,44 +225,62 @@ fn firehose_xml_setup(op: &str, kvps: &[(&str, &str)]) -> anyhow::Result<Vec<u8>
 
 /// Read one XML document without consuming any following raw bytes or documents.
 fn firehose_read_xml<T: QdlChan>(channel: &mut T, welcome: bool) -> Result<Option<Element>> {
+    enum Fragment {
+        Eof,
+        Framing(usize),
+        Xml(usize),
+    }
+
     let limit = channel.fh_config().xml_buf_size;
     if limit == 0 || limit > 16 * 1024 * 1024 {
         bail!("Invalid XML receive limit {limit}");
     }
     let mut pending = Vec::new();
     loop {
-        let available = match channel.fill_buf() {
-            Ok(buf) => buf,
+        channel.check_response_wait()?;
+        let old_len = pending.len();
+        let fragment = channel.fill_response_buf().map(|available| {
+            if available.is_empty() {
+                return Fragment::Eof;
+            }
+            // Skip framing whitespace only before the next XML document.
+            if old_len == 0 {
+                let whitespace = available
+                    .iter()
+                    .take_while(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+                    .count();
+                if whitespace != 0 {
+                    return Fragment::Framing(whitespace);
+                }
+            }
+            // Copy only up to the document limit, including a possible split end marker.
+            let copied = available.len().min(limit - old_len);
+            pending.extend_from_slice(&available[..copied]);
+            Fragment::Xml(copied)
+        });
+        channel.check_response_wait()?;
+        let copied = match fragment {
+            Ok(Fragment::Xml(copied)) => copied,
+            Ok(Fragment::Framing(whitespace)) => {
+                channel.consume(whitespace);
+                continue;
+            }
+            Ok(Fragment::Eof) => {
+                return Err(io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "EOF before Firehose response",
+                )
+                .into());
+            }
             Err(e) if welcome && pending.is_empty() && e.kind() == ErrorKind::TimedOut => {
                 return Ok(None);
             }
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(e) => return Err(e.into()),
         };
-        if available.is_empty() {
-            return Err(
-                io::Error::new(ErrorKind::UnexpectedEof, "EOF before Firehose response").into(),
-            );
-        }
-        // XML framing whitespace can remain after the welcome end marker or a
-        // preceding response. Skip it only before the next XML document; return
-        // at </data> so raw-storage bytes after an ACK remain untouched.
-        if pending.is_empty() {
-            let whitespace = available
-                .iter()
-                .take_while(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
-                .count();
-            if whitespace != 0 {
-                channel.consume(whitespace);
-                continue;
-            }
-        }
-        // Copy only up to the document limit, including a possible split end marker.
-        let old_len = pending.len();
-        let copied = available.len().min(limit - old_len);
-        pending.extend_from_slice(&available[..copied]);
         if let Some(pos) = pending.windows(7).position(|w| w == b"</data>") {
             let end = pos + 7;
+            // Leave any following raw data or XML in the channel buffer.
             channel.consume(end - old_len);
             let xml = Element::parse(&pending[..end]).context("Invalid Firehose XML")?;
             if xml.name != "data" {
@@ -312,6 +330,7 @@ fn firehose_response<T: QdlChan>(
         let node = nodes[0];
         if node.name == "log" {
             let message = log_message(channel, node);
+            channel.check_response_wait()?;
             if collect_logs {
                 log_bytes += message.len();
                 if log_bytes > 16 * 1024 * 1024 {
@@ -367,6 +386,7 @@ pub fn firehose_read_welcome<T: QdlChan>(channel: &mut T) -> Result<Vec<String>>
             bail!("Expected a welcome log");
         }
         let message = log_message(channel, nodes[0]);
+        channel.check_response_wait()?;
         let done = message.starts_with("INFO: End of supported functions");
         log_bytes += message.len();
         if log_bytes > 16 * 1024 * 1024 {
@@ -746,7 +766,7 @@ pub fn firehose_read_storage(
         }
     }
     out.flush().context("Error flushing storage output")?;
-    // nusb's streaming reader consumes USB packet delimiters itself.
+    // The terminal XML refill consumes any remaining USB short-packet delimiter.
     if firehose_read(channel, firehose_parser_ack_nak)? != FirehoseStatus::Ack {
         bail!("Failed to complete 'read' op");
     }
